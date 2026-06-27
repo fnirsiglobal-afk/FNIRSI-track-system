@@ -167,6 +167,8 @@ def extract_track_fields(track_info: dict) -> dict:
     if providers:
         carrier_name = providers[0].get("provider", {}).get("name", "") or ""
 
+    is_delivered = (latest_status.get("status") == "Delivered")
+
     fields = {
         FIELD_SUB_STATUS:      sub_status_desc or sub_status or None,
         FIELD_SUB_STATUS_DESC: sub_status_desc or None,
@@ -177,7 +179,7 @@ def extract_track_fields(track_info: dict) -> dict:
         FIELD_UPDATE_TIME:     now_ts(),
     }
     # 过滤 None
-    return {k: v for k, v in fields.items() if v is not None}
+    return {k: v for k, v in fields.items() if v is not None}, is_delivered
 
 
 # ══════════════════════════════════════════════════════════════
@@ -194,6 +196,21 @@ async def track17_register(client: httpx.AsyncClient, tracking_numbers: list[str
         timeout=20,
     )
     return r.json()
+
+
+async def track17_stoptrack(client: httpx.AsyncClient, tracking_numbers: list[str]):
+    """停止追踪已签收的单号，节省配额"""
+    payload = [{"number": n} for n in tracking_numbers]
+    try:
+        r = await client.post(
+            f"{TRACK17_BASE}/stoptrack",
+            headers={"17token": TRACK17_API_KEY, "Content-Type": "application/json"},
+            json=payload,
+            timeout=15,
+        )
+        logger.info(f"停止追踪 {tracking_numbers}: {r.json().get('code')}")
+    except Exception as e:
+        logger.warning(f"停止追踪失败（不影响主流程）: {e}")
 
 
 async def track17_gettrackinfo(client: httpx.AsyncClient, tracking_numbers: list[dict]) -> dict:
@@ -246,12 +263,16 @@ async def update_record(client: httpx.AsyncClient, token: str,
     return data
 
 
-async def list_all_records(client: httpx.AsyncClient, token: str) -> list:
-    """拉取全部有「物流单号」字段的记录（自动翻页）"""
+async def list_all_records(client: httpx.AsyncClient, token: str,
+                          skip_delivered: bool = True) -> list:
+    """拉取全部有「物流单号」字段的记录（自动翻页）。
+    skip_delivered=True 时跳过已签收的行（默认开启，用于定时刷新）。
+    """
     records = []
     page_token = None
+    field_names = f'["{FIELD_TRACKING_NO}", "{FIELD_SUB_STATUS}"]'
     while True:
-        params = {"page_size": 100, "field_names": f'["{FIELD_TRACKING_NO}"]'}
+        params = {"page_size": 100, "field_names": field_names}
         if page_token:
             params["page_token"] = page_token
         url = (f"{FS_BASE}/bitable/v1/apps/{BITABLE_APP_TOKEN}"
@@ -266,11 +287,20 @@ async def list_all_records(client: httpx.AsyncClient, token: str) -> list:
         if data.get("code") != 0:
             raise RuntimeError(f"拉取记录失败: {data.get('msg')}")
         for item in data.get("data", {}).get("items", []):
-            no_field = item.get("fields", {}).get(FIELD_TRACKING_NO, "")
+            fields = item.get("fields", {})
+            no_field = fields.get(FIELD_TRACKING_NO, "")
             no = (no_field.strip() if isinstance(no_field, str)
                   else (no_field or {}).get("text", "").strip())
-            if no:
-                records.append({"record_id": item["record_id"], "tracking_no": no})
+            if not no:
+                continue
+            # 飞书单选字段值可能是字符串或 {"text": "..."} 对象
+            sub_status_raw = fields.get(FIELD_SUB_STATUS, "")
+            sub_status_val = (sub_status_raw if isinstance(sub_status_raw, str)
+                              else (sub_status_raw or {}).get("text", ""))
+            if skip_delivered and sub_status_val in ("已签收", "Delivered_Other"):
+                logger.debug(f"跳过已签收: {no}")
+                continue
+            records.append({"record_id": item["record_id"], "tracking_no": no})
         if not data.get("data", {}).get("has_more"):
             break
         page_token = data.get("data", {}).get("page_token")
@@ -340,10 +370,13 @@ async def refresh_all_records():
                         fail += 1
                         continue
                     try:
-                        fields = extract_track_fields(ti)
+                        fields, is_delivered = extract_track_fields(ti)
                         await update_record(client, token, rec["record_id"], fields)
                         logger.info(f"  ✓ {rec['tracking_no']}")
                         ok += 1
+                        if is_delivered:
+                            logger.info(f"  已签收，停止追踪: {rec['tracking_no']}")
+                            await track17_stoptrack(client, [rec["tracking_no"]])
                     except Exception as e:
                         logger.error(f"  ✗ {rec['tracking_no']} → {e}")
                         fail += 1
@@ -431,7 +464,7 @@ async def webhook_feishu(request: Request):
                 return
 
             track_info = accepted[0].get("track_info") or {}
-            fields = extract_track_fields(track_info)
+            fields, is_delivered = extract_track_fields(track_info)
             if not fields:
                 logger.warning(f"无有效字段可写入: {tracking_no}")
                 return
@@ -443,6 +476,12 @@ async def webhook_feishu(request: Request):
                 logger.info(f"飞书写入成功: {tracking_no}")
             except Exception as e:
                 logger.error(f"飞书写入失败: {e}")
+                return
+
+            # Step 4：已签收则停止 17TRACK 追踪
+            if is_delivered:
+                logger.info(f"已签收，停止追踪: {tracking_no}")
+                await track17_stoptrack(client, [tracking_no])
 
     # 立即返回 200，后台执行（避免飞书 webhook 超时）
     asyncio.create_task(_process())
@@ -502,7 +541,7 @@ async def webhook_17track(request: Request):
                     logger.warning(f"未找到 record_id: {tracking_no}")
                     continue
 
-                fields = extract_track_fields(track_info)
+                fields, is_delivered = extract_track_fields(track_info)
                 if not fields:
                     continue
                 try:
@@ -510,6 +549,11 @@ async def webhook_17track(request: Request):
                     logger.info(f"推送写入成功: {tracking_no}")
                 except Exception as e:
                     logger.error(f"推送写入失败 {tracking_no}: {e}")
+                    continue
+
+                if is_delivered:
+                    logger.info(f"已签收，停止追踪: {tracking_no}")
+                    await track17_stoptrack(client, [tracking_no])
 
     asyncio.create_task(_process_push())
     return JSONResponse({"code": 0, "msg": "received"})
@@ -560,6 +604,8 @@ async def debug_records():
                 for i in items
             ]
         })
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}

@@ -54,7 +54,6 @@ FIELD_SUB_STATUS_DESC= os.getenv("FIELD_SUB_STATUS_DESC","子状态描述")
 FIELD_LATEST_EVENT_T = os.getenv("FIELD_LATEST_EVENT_T", "最新事件时间")
 FIELD_CARRIER        = os.getenv("FIELD_CARRIER",        "运输商")
 FIELD_PICKUP_TIME    = os.getenv("FIELD_PICKUP_TIME",    "揽收时间")
-FIELD_DELIVERED_TIME = os.getenv("FIELD_DELIVERED_TIME", "签收时间")
 FIELD_UPDATE_TIME    = os.getenv("FIELD_UPDATE_TIME",    "更新时间")
 
 # 定时任务
@@ -147,10 +146,6 @@ def extract_track_fields(track_info: dict) -> dict:
 
     latest_event_time = iso_to_ts(latest_event.get("time_utc"))
 
-    # 揽收时间：从 time_metrics 或事件列表取
-    pickup_time = iso_to_ts(time_metrics.get("pickup_time") or
-                            time_metrics.get("pickup_date"))
-
     # 签收时间：遍历事件找 Delivered_Other 的 time_utc
     delivered_time = None
     providers = track_info.get("tracking", {}).get("providers") or []
@@ -174,7 +169,6 @@ def extract_track_fields(track_info: dict) -> dict:
         FIELD_SUB_STATUS_DESC: sub_status_desc or None,
         FIELD_LATEST_EVENT_T:  latest_event_time,
         FIELD_CARRIER:         carrier_name or None,
-        FIELD_PICKUP_TIME:     pickup_time,
         FIELD_DELIVERED_TIME:  delivered_time,
         FIELD_UPDATE_TIME:     now_ts(),
     }

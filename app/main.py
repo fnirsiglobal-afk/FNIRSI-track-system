@@ -391,6 +391,14 @@ async def refresh_all_records():
                     ti = info_map.get(rec["tracking_no"].upper())
                     if not ti:
                         logger.warning(f"  17TRACK 未返回数据: {rec['tracking_no']}")
+                        try:
+                            await update_record(client, token, rec["record_id"], {
+                                FIELD_SUB_STATUS:      "无",
+                                FIELD_SUB_STATUS_DESC: "未返回数据",
+                                FIELD_UPDATE_TIME:     now_ts(),
+                            })
+                        except Exception as e:
+                            logger.error(f"  写入'未返回数据'失败: {e}")
                         fail += 1
                         continue
                     try:
@@ -485,6 +493,15 @@ async def webhook_feishu(request: Request):
             accepted = resp.get("data", {}).get("accepted", [])
             if not accepted:
                 logger.warning(f"17TRACK 暂无数据: {tracking_no}")
+                try:
+                    fs_token = await get_feishu_token(client)
+                    await update_record(client, fs_token, record_id, {
+                        FIELD_SUB_STATUS:      "无",
+                        FIELD_SUB_STATUS_DESC: "未返回数据",
+                        FIELD_UPDATE_TIME:     now_ts(),
+                    })
+                except Exception as e:
+                    logger.error(f"写入'未返回数据'失败: {e}")
                 return
 
             track_info = accepted[0].get("track_info") or {}
